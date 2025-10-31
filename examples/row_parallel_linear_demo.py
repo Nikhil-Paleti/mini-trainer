@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -6,24 +7,37 @@ from torch.nn import functional as F
 
 
 def init_dist():
+    """Initialize distributed backend and return (rank, world, device)."""
     if not dist.is_initialized():
-        dist.init_process_group(backend="gloo")
-    return dist.get_rank(), dist.get_world_size()
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+
+    rank = dist.get_rank()
+    world = dist.get_world_size()
+
+    # Assign each rank its device
+    if torch.cuda.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))  # fallback to rank
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+    else:
+        device = torch.device("cpu")
+
+    return rank, world, device
 
 
 class RowParallelLinear(nn.Module):
     """
     Row-sharded Linear:
       - Full weight: [in_features, out_features]
-      - Each rank holds shard: [in_features/world_size, out_features]  (rows of W)
+      - Each rank holds shard: [in_features/world_size, out_features]
       - Forward:
-          x is sliced on features: x_local = x[:, in_slice]
+          x_local = x[:, in_slice]
           y_local = x_local @ W_local
-          y = SUM_r(y_local)  via all_reduce
+          y = SUM_r(y_local) via all_reduce
       - Backward:
-          autograd gives local grads for W_local and x_local.
-          No special hook needed for x here because we explicitly sliced x (each rank
-          owns its chunk). The output sum is correct via all_reduce in forward.
+          Autograd computes local grads for W_local and x_local.
+          No input hook needed since x is already partitioned.
     """
     def __init__(self, in_features, out_features, bias=True):
         super().__init__()
@@ -36,37 +50,37 @@ class RowParallelLinear(nn.Module):
         self.in_per_rank = in_features // world
         self.out_features = out_features
 
-        # local shard of rows
+        # Local row shard of the weight
         self.weight = nn.Parameter(torch.empty(self.in_per_rank, out_features))
-        # Bias is logically full-sized; keep one per rank (identical updates in lockstep).
+        # Full bias (identical across ranks)
         self.bias = nn.Parameter(torch.empty(out_features)) if bias else None
-        self.reset_parameters()
 
-        # Precompute our input slice
+        # Slice for local input chunk
         start = rank * self.in_per_rank
         end = start + self.in_per_rank
         self._in_slice = slice(start, end)
 
+        self.reset_parameters()
+
     def reset_parameters(self):
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
         if self.bias is not None:
-            fan_in = self.weight.size(0) * self.world  # effective fan_in of full W
-            bound = 1.0 / (fan_in ** 0.5)
+            fan_in_full = self.weight.size(0) * self.world
+            bound = 1.0 / (fan_in_full ** 0.5)
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Scatter input features to this rank
-        # x_full: [B, Din] -> x_local: [B, Din/world]
+        # Local input chunk
         x_local = x[:, self._in_slice]
 
         # Local matmul → partial output [B, Dout]
-        y_local = x_local.matmul(self.weight)
+        y_local = x_local @ self.weight
 
-        # Sum partial outputs across ranks to get full y
+        # Sum partial outputs across ranks → full y
         if self.world > 1:
-            y_local = dnnF.all_reduce(y_local)
+            y_local = dnnF.all_reduce(y_local)  # autograd-safe
 
-        # Bias is full-sized; add on every rank (grads identical across ranks)
+        # Bias added identically on all ranks
         if self.bias is not None:
             y_local = y_local + self.bias
 
@@ -74,27 +88,27 @@ class RowParallelLinear(nn.Module):
 
 
 def main():
-    rank, world = init_dist()
-    torch.manual_seed(0)
+    rank, world, device = init_dist()
+    torch.manual_seed(0 + rank)
 
     B, Din, Dout = 4, 8, 12
     assert Din % world == 0
 
-    layer = RowParallelLinear(Din, Dout, bias=True)
+    layer = RowParallelLinear(Din, Dout, bias=True).to(device)
+
     # Toy input/target
-    x = torch.randn(B, Din, requires_grad=True)
-    t = torch.randint(0, Dout, (B,))
+    x = torch.randn(B, Din, device=device, requires_grad=True)
+    t = torch.randint(0, Dout, (B,), device=device)
 
-    # Forward
-    y = layer(x)                 # [B, Dout]
+    # Forward + Backward
+    y = layer(x)
     loss = F.cross_entropy(y, t)
-
-    # Backward
     loss.backward()
 
     if rank == 0:
         print("RowParallelLinear OK:",
-              dict(y=y.shape,
+              dict(device=str(device),
+                   y=y.shape,
                    x_grad=(x.grad is not None),
                    w_grad=(layer.weight.grad is not None),
                    b_grad=(layer.bias.grad is not None if layer.bias is not None else None)))
