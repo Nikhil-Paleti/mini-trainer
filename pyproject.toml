@@ -9,4 +9,5 @@ dependencies = [
     "rich>=14.2.0",
     "torch>=2.9.0",
     "transformers>=4.57.1",
+    "wandb>=0.23.0",
 ]
